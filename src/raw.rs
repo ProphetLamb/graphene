@@ -1,406 +1,500 @@
 use core::{
-    alloc::{Allocator, Layout},
-    marker::PhantomData,
-    mem::{self, MaybeUninit},
-    ops::Index,
-    ptr::{self, NonNull, Unique},
+    alloc::Allocator,
+    mem,
+    ops::{Index, IndexMut},
 };
 
-use alloc::{
-    alloc::{handle_alloc_error, Global},
-    raw_vec::RawVec,
-    vec::Vec,
-};
+use alloc::{alloc::Global, raw_vec::RawVec};
 
-pub unsafe trait SliceIndex<Idx: Copy + Clone> {
-    type Output;
+/// Same interface as `SliceIndex` but for collection.
+pub unsafe trait UnsafeIndex<Idx: Copy + ?Sized> {
+    type Output: ?Sized;
 
     fn get(&self, index: Idx) -> Option<&Self::Output> {
-        if self.guard_index(index) {
-            Some(unsafe { self.get_unchecked(index) })
-        } else {
-            None
+        match self.guard_index(index) {
+            Ok(_) => Some(unsafe { &*self.get_unchecked(index) }),
+            Err(_) => None,
         }
     }
 
     fn get_mut(&mut self, index: Idx) -> Option<&mut Self::Output> {
-        if self.guard_index(index) {
-            Some(unsafe { self.get_mut_unchecked(index) })
-        } else {
-            None
+        match self.guard_index(index) {
+            Ok(_) => Some(unsafe { &mut *self.get_unchecked_mut(index) }),
+            Err(_) => None,
         }
     }
 
-    fn guard_index(&self, index: Idx) -> bool;
+    fn guard_index(&self, index: Idx) -> Result<(), ()>;
 
-    unsafe fn get_unchecked(&self, index: Idx) -> &Self::Output;
+    unsafe fn get_unchecked(&self, index: Idx) -> *const Self::Output;
 
-    unsafe fn get_mut_unchecked(&mut self, index: Idx) -> &mut Self::Output;
+    unsafe fn get_unchecked_mut(&mut self, index: Idx) -> *mut Self::Output;
 }
 
-/// The number of vertices in a pack.
-/// Must always be smaller then `u16::MAX`.
-///
-/// The size of a `Pack` should is required to be as close as possible to a multiple of a page 4096 bytes when allocating.
-/// By default `NUM_V_PAC` is chosen so that a `Pack` has a size of less then 2 pages.
-pub const NUM_V_PAC: usize = 2 * 4096 / (4 * mem::size_of::<usize>()) - 8 * mem::size_of::<usize>();
-
-/// The Edge represents a reference to a vertex in a graph.
-/// The owner of the Edge is the origin of which the edge is outbound,
-/// and the references vertex the target to which the edge is inbound.
-///
-/// The `size_of::<Edge>()` is 8 bytes which is the `sizeof::<usize>()` for 64bit operating systems,
-/// and makes allocating easier when compared to the 7 bytes necessary to represent an `Edge`.
-#[derive(Clone, Copy)]
-pub struct Edge {
-    /// Indicates whether the edge is marked as deleted or not.
-    deleted_flag: u16,
-
-    /// The index of the pack in the graph in which the vertex resides.
-    pack_id: u32,
-
-    /// The index of the vertex in the pack in which the vertex resides.
-    /// Has a maximum value of `NUM_V_PAC`.
-    vertex_id: u16,
+struct Edge {
+    vertex_id_flags: u32,
+    segment_id: u32,
 }
 
-/// Each `Vertex` represents a node in the graph and can have multiple outgoing edges.
-/// Optionally each `Edge` may have a property value stored in `edge_properties` parallel to `adjacent_edges`
-/// Managing and mutating vertices is the job of the `Pack` to which the respective vertex belongs.
-pub struct Vertex<E> {
-    /// The number of `adjacent_edges` and `edge_properties`.
-    ///
-    /// A value of :
-    /// * `!0` indicates a deleted Vertex.
-    /// * `1` indicates that `adjacent_edges` points directly to the adjacent vertex instead of a vector.
+impl Edge {
+    /// The amount by which to shift the flags in the `vertex_id_flags`.
+    pub const FLAGS_BSH: u32 = ((mem::size_of::<u32>() - 1) * mem::size_of::<u8>()) as u32;
+    /// The flag marking the edge as existed, if it is missing the edge is deleted. This is to make use of calloc.
+    const FLAG_DEL: u32 = 0x01 << Self::FLAGS_BSH;
+    /// The maximum valid id value of any `Vertex`.
+    pub const VERTEX_ID_MAX: u32 = u32::MAX >> mem::size_of::<u8>();
+
+    pub fn deleted() -> Edge {
+        Edge {
+            vertex_id_flags: Self::FLAG_DEL,
+            segment_id: !0,
+        }
+    }
+
+    #[inline]
+    pub fn vertex_id(&self) -> u32 {
+        self.vertex_id_flags & Self::VERTEX_ID_MAX
+    }
+
+    pub fn vertex_id_set(&mut self, vertex_id: u32) {
+        debug_assert!(vertex_id & Self::VERTEX_ID_MAX == vertex_id);
+        self.vertex_id_flags =
+            (self.vertex_id_flags & !Self::VERTEX_ID_MAX) | (vertex_id & Self::VERTEX_ID_MAX);
+    }
+
+    #[inline]
+    pub fn flags(&self) -> u32 {
+        self.vertex_id_flags >> Self::FLAGS_BSH
+    }
+
+    #[inline]
+    pub fn flags_set(&mut self, flags: u32) {
+        debug_assert!(flags & (u8::MAX as u32) == flags);
+        self.vertex_id_flags =
+            (self.vertex_id_flags & Self::VERTEX_ID_MAX) | (flags << Self::FLAGS_BSH);
+    }
+
+    #[inline]
+    pub fn is_del(&self) -> bool {
+        self.vertex_id_flags & Self::FLAG_DEL == 0
+    }
+
+    pub fn del(&mut self) {
+        if !self.is_del() {
+            self.segment_id = !0;
+            self.vertex_id_flags = 0;
+        }
+    }
+}
+
+struct Vertex<E, A: Allocator + Copy> {
+    edges: RawVec<Edge, A>,
+    edges_payloads: RawVec<E, A>,
+    /// The total number of elements.
     len: usize,
-    cap: usize,
-
-    adjacent_edges: Unique<Edge>,
-
-    edge_properties: Unique<E>,
+    /// No free items exist before.
+    first_free_hint: usize,
+    /// No occupied items exists after.
+    last_occupied_hint: usize,
 }
 
-impl<E> Vertex<E> {
-    pub fn is_dropped(&self) -> bool {
-        self.len == !0
-    }
-
-    pub fn len(&self) -> usize {
-        self.len as usize
-    }
-}
-
-pub struct Pack<V, E, A: Allocator> {
-    /// The `vertices` the pack contains.
-    vertices: Unique<Vertex<E>>,
-
-    /// The length of `vertices` of the pack.
-    length: usize,
-
-    /// The `vertex_properties` are parallel to `vertices`.
-    vertex_properties: RawVec<V, A>,
-}
-
-impl<V, E, A: Allocator> Pack<V, E, A> {
-    fn allocate_in(capacity: usize, alloc: A) -> Self {
-        let (vertices, length) = alloc_array(capacity, &alloc);
-        Self {
-            vertices,
-            length,
-            vertex_properties: RawVec::new_in(alloc),
-        }
-    }
-
-    fn allocate_with_props_in(capacity: usize, alloc: A) -> Self {
-        let (vertices, length) = alloc_array(capacity, &alloc);
-        Self {
-            vertices,
-            length,
-            vertex_properties: RawVec::with_capacity_in(capacity, alloc),
-        }
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.length
-    }
-
-    #[inline]
-    pub fn allocator(&self) -> &A {
-        self.vertex_properties.allocator()
-    }
-
-    pub fn insert(&mut self, vertex: Vertex<E>) {}
-
-    fn get_prop(&self, index: usize) -> Option<&V> {
-        if self.guard_index(index) {
-            Some(unsafe { self.get_prop_unchecked(index) })
-        } else {
-            None
-        }
-    }
-
-    fn get_prop_mut(&mut self, index: usize) -> Option<&mut V> {
-        if self.guard_index(index) {
-            Some(unsafe { self.get_prop_mut_unchecked(index) })
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    unsafe fn vertex_ptr_at_unchecked(&self, index: usize) -> *mut Vertex<E> {
-        self.vertices.as_ptr().add(index)
-    }
-
-    #[inline]
-    unsafe fn get_prop_unchecked(&self, index: usize) -> &V {
-        &*self.prop_ptr_at_unchecked(index)
-    }
-
-    #[inline]
-    unsafe fn get_prop_mut_unchecked(&mut self, index: usize) -> &mut V {
-        &mut *self.prop_ptr_at_unchecked(index)
-    }
-
-    #[inline]
-    unsafe fn prop_ptr_at_unchecked(&self, index: usize) -> *mut V {
-        self.vertex_properties.ptr().add(index)
-    }
-
-    unsafe fn allocate_vertex_unchecked(&mut self, index: usize, capacity: usize) {
-        let alloc = self.allocator();
-        let (adjacent_edges, capacity) = alloc_array(capacity, alloc);
-        let vertex = self.get_mut_unchecked(index);
-        vertex.adjacent_edges = adjacent_edges;
-        vertex.edge_properties = Unique::dangling();
-        vertex.cap = capacity;
-        vertex.len = 0;
-    }
-
-    unsafe fn allocate_vertex_with_props_unchecked(
-        &mut self,
-        vertex: &mut Vertex<E>,
-        capacity: usize,
-    ) {
-        let alloc = self.allocator();
-        let (adjacent_edges, capacity) = alloc_array(capacity, alloc);
-        let (edge_properties, capacity) = alloc_array(capacity, alloc);
-        vertex.adjacent_edges = adjacent_edges;
-        vertex.edge_properties = edge_properties;
-        vertex.cap = capacity;
-        vertex.len = 0;
-    }
-
-    unsafe fn reserve_vertex_unchecked(&mut self, vertex: &mut Vertex<E>, additional: usize) {
-        debug_assert!(additional != 0);
-        let alloc = self.allocator();
-        let len = vertex.len();
-        let cap = vertex.cap;
-        let required_cap = cap + additional;
-        let (adjacent_edges, capacity) = alloc_array(required_cap, alloc);
-        ptr::copy(vertex.adjacent_edges.as_ptr(), adjacent_edges.as_ptr(), len);
-        self.drop_vertex_unchecked(vertex);
-        vertex.adjacent_edges = adjacent_edges;
-        vertex.edge_properties = Unique::dangling();
-        vertex.cap = capacity;
-        vertex.len = len;
-    }
-
-    unsafe fn reserve_vertex_with_props_unchecked(
-        &mut self,
-        vertex: &mut Vertex<E>,
-        additional: usize,
-    ) {
-        debug_assert!(additional != 0);
-        let alloc = self.allocator();
-        let len = vertex.len();
-        let cap = vertex.cap;
-        let required_cap = cap + additional;
-        let (adjacent_edges, capacity) = alloc_array(required_cap, alloc);
-        ptr::copy(vertex.adjacent_edges.as_ptr(), adjacent_edges.as_ptr(), len);
-        let (edge_properties, capacity) = alloc_array(required_cap, alloc);
-        ptr::copy(vertex.adjacent_edges.as_ptr(), adjacent_edges.as_ptr(), len);
-        self.drop_vertex_with_props_unchecked(vertex);
-        vertex.adjacent_edges = adjacent_edges;
-        vertex.edge_properties = edge_properties;
-        vertex.cap = capacity;
-        vertex.len = len;
-    }
-
-    unsafe fn drop_vertex_unchecked(&mut self, vertex: &mut Vertex<E>) {
-        let (ptr, layout) = array_memory(vertex.adjacent_edges, vertex.cap);
-        vertex.adjacent_edges = Unique::dangling();
-        vertex.cap = 0;
-        vertex.len = !0;
-        self.allocator().deallocate(ptr, layout);
-    }
-
-    unsafe fn drop_vertex_with_props_unchecked(&mut self, vertex: &mut Vertex<E>) {
-        let vertex = &mut *vertex;
-        let (adj_ptr, adj_layout) = array_memory(vertex.adjacent_edges, vertex.cap);
-        let (edge_ptr, edge_layout) = array_memory(vertex.edge_properties, vertex.cap);
-        vertex.adjacent_edges = Unique::dangling();
-        vertex.edge_properties = Unique::dangling();
-        vertex.cap = 0;
-        vertex.len = !0;
-        self.allocator().deallocate(adj_ptr, adj_layout);
-        self.allocator().deallocate(edge_ptr, edge_layout);
-    }
-}
-
-unsafe impl<V, E, A: Allocator> SliceIndex<usize> for Pack<V, E, A> {
-    type Output = Vertex<E>;
-
-    #[inline]
-    unsafe fn get_unchecked(&self, index: usize) -> &Self::Output {
-        &*self.vertex_ptr_at_unchecked(index)
-    }
-
-    #[inline]
-    unsafe fn get_mut_unchecked(&mut self, index: usize) -> &mut Self::Output {
-        &mut *self.vertex_ptr_at_unchecked(index)
-    }
-
-    #[inline]
-    fn guard_index(&self, index: usize) -> bool {
-        index < self.length && index < isize::MAX as usize
-    }
-}
-
-impl<V, E, A: Allocator> Drop for Pack<V, E, A> {
+impl<E, A: Allocator + Copy> Drop for Vertex<E, A> {
     fn drop(&mut self) {
-        let (ptr, layout) = array_memory(self.vertices, self.length);
-        unsafe {
-            self.allocator().deallocate(ptr, layout);
-        };
+        drop(self.edges_payloads);
+        self.len = 0;
+        self.first_free_hint = 0;
+        self.last_occupied_hint = !0;
     }
 }
 
-pub struct PackedSparseRow<V, E, A: Allocator = Global> {
-    /// The vector of pointers to the packs.
-    /// Reading an writing are atomic because `Unique` is a pointer.
-    packs: Vec<Pack<V, E, A>, A>,
-}
-
-impl<V, E> PackedSparseRow<V, E> {
-    #[inline]
-    pub fn new() -> Self {
-        Self::new_in(Global)
-    }
-
-    #[inline]
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self::with_capacity_in(capacity, Global)
-    }
-}
-
-impl<V, E, A: Allocator> PackedSparseRow<V, E, A> {
-    #[inline]
+impl<E, A: Allocator + Copy> Vertex<E, A> {
     pub fn new_in(alloc: A) -> Self {
         Self {
-            packs: Vec::new_in(alloc),
+            edges: RawVec::new_in(alloc),
+            edges_payloads: RawVec::new_in(alloc),
+            edges_init: BitMarker::new(),
+            len: 0,
+            first_free_hint: 0,
+            last_occupied_hint: !0,
         }
     }
 
     #[inline]
-    pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
-        Self {
-            packs: Vec::with_capacity_in(capacity, alloc),
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn cap(&self) -> usize {
+        self.edges.capacity()
+    }
+
+    pub fn insert(&mut self, edge: Edge, payload: E) -> Result<usize, ()> {
+        if self.len() == self.cap() {
+            return Err(());
+        }
+        let next_free = self.guard_insert()?;
+        // The element at which we insert must be deleted.
+        debug_assert!(unsafe { &*self.get_unchecked(next_free) }.is_del());
+        unsafe { self.set_unchecked(next_free, edge, payload) };
+        self.len += 1;
+        Ok(next_free)
+    }
+
+    pub fn remove_at(&mut self, index: usize) -> Result<(), ()> {
+        self.guard_remove(index)?;
+        let vertex = self.get_mut(index).ok_or(())?;
+        vertex.del();
+        Ok(())
+    }
+
+    fn guard_insert(&mut self) -> Result<usize, ()> {
+        if self.len == self.cap() {
+            return Err(());
+        }
+        // Last occupied is !0 when empty. We need to intentionally overflow in that case to reach zero.
+        let after_last_occupied = unsafe { self.last_occupied_hint.unchecked_add(1) };
+        if after_last_occupied == self.len {
+            // There are no holes.
+            self.last_occupied_hint = after_last_occupied;
+            self.first_free_hint = after_last_occupied + 1;
+            return Ok(after_last_occupied);
+        }
+        let mut first_free = self.first_free_hint;
+        while first_free < after_last_occupied {
+            if !self.vertices_init.is_set_at(first_free) {
+                self.first_free_hint = first_free + 1;
+                return Ok(first_free);
+            }
+            first_free += 1;
+        }
+
+        // after_last_occupied must be within the capacity, because we still have free spots.
+        debug_assert!(after_last_occupied < self.cap());
+        self.last_occupied_hint = after_last_occupied + 1;
+        self.first_free_hint = after_last_occupied;
+        Ok(after_last_occupied)
+    }
+
+    fn guard_remove_at(&mut self, index: usize) -> Result<(), ()> {
+        if self.len == self.cap() {
+            return Err(());
+        }
+        let last_occupied_hint = self.last_occupied_hint;
+        if last_occupied_hint > index {
+            let mut last_occupied = index + 1;
+            while last_occupied < last_occupied_hint {
+                if self.vertices_init.is_set_at(last_occupied) {
+                    self.last_occupied_hint = last_occupied;
+                    return Ok(());
+                }
+                last_occupied += 1
+            }
+            // No occupied items beyond index.
+            self.last_occupied_hint = index - 1;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn get_payload_unchecked(&self, index: usize) -> &E {
+        unsafe { &*self.edges_payloads.ptr().add(index) }
+    }
+
+    #[inline]
+    fn get_payload_unchecked_mut(&mut self, index: usize) -> &mut E {
+        unsafe { &mut *self.edges_payloads.ptr().add(index) }
+    }
+
+    #[inline(never)]
+    unsafe fn set_unchecked(&mut self, index: usize, edge: Edge, payload: E) {
+        *self.get_unchecked_mut(index) = edge;
+        if mem::size_of::<E>() != 0 {
+            *self.get_payload_unchecked_mut(index) = payload;
         }
     }
+}
 
-    /// Inserts a `Vertex` into the array, and returns the `Edge` referencing the inserted `Vertex`.
-    pub fn insert(&mut self, vertex: Vertex<E>) -> Edge {
-        todo!()
+impl<E, A: Allocator + Copy> IndexMut<usize> for Vertex<E, A> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        match self.get_mut(index) {
+            Some(edge) => edge,
+            None => index_out_of_range(),
+        }
     }
+}
 
-    /// Deletes a `Vertex` from the array, by marking it as deleted.
-    ///
-    /// Returns `true` if the `Vertex` was deleted, otherwise; `false`.
-    pub fn remove(&mut self, edge_to_vertex: Edge) -> bool {
-        todo!()
+impl<E, A: Allocator + Copy> Index<usize> for Vertex<E, A> {
+    type Output = Edge;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        match self.get(index) {
+            Some(edge) => edge,
+            None => index_out_of_range(),
+        }
     }
+}
 
-    pub fn get(&self, edge_to_vertex: Edge) -> Option<&Vertex<E>> {
-        if self.check_edge(edge_to_vertex) {
-            Some(unsafe { self.get_unchecked(edge_to_vertex) })
+unsafe impl<E, A: Allocator + Copy> UnsafeIndex<usize> for Vertex<E, A> {
+    type Output = Edge;
+
+    #[inline]
+    fn guard_index(&self, index: usize) -> Result<(), ()> {
+        if index < isize::MAX as usize {
+            Ok(())
         } else {
-            None
+            Err(())
         }
     }
 
-    pub fn get_mut(&mut self, edge_to_vertex: Edge) -> Option<&Vertex<E>> {
-        if self.check_edge(edge_to_vertex) {
-            Some(unsafe { self.get_mut_unchecked(edge_to_vertex) })
+    #[inline]
+    unsafe fn get_unchecked(&self, index: usize) -> *const Self::Output {
+        self.edges.ptr().add(index)
+    }
+
+    #[inline]
+    unsafe fn get_unchecked_mut(&mut self, index: usize) -> *mut Self::Output {
+        self.edges.ptr().add(index)
+    }
+}
+
+struct Pack<V, E, A: Allocator + Copy> {
+    vertices: RawVec<Vertex<E, A>, A>,
+    vertices_payloads: RawVec<V, A>,
+    vertices_init: BitMarker,
+    /// The total number of elements.
+    len: usize,
+    /// No free items exist before.
+    first_free_hint: usize,
+    /// No occupied items exists after.
+    last_occupied_hint: usize,
+}
+
+impl<V, E, A: Allocator + Copy> Pack<V, E, A> {
+    /// The maximum number of Vertices for a `Pack` to fit in one 4096byte memory page.
+    pub const PAGE_PACK_VERTEX_NUM: usize =
+        (4096 - mem::size_of::<Pack<V, E, Global>>()) / mem::size_of::<Vertex<E, Global>>();
+
+    pub fn with_capacity_in(capacity: usize, alloc: A) -> Pack<V, E, A> {
+        Pack {
+            vertices: RawVec::with_capacity_zeroed_in(capacity, alloc),
+            vertices_payloads: RawVec::with_capacity_in(capacity, alloc),
+            vertices_init: BitMarker::new(capacity),
+            len: 0,
+            first_free_hint: 0,
+            last_occupied_hint: !0,
+        }
+    }
+
+    #[inline]
+    pub fn cap(&self) -> usize {
+        self.vertices.capacity()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn insert(&mut self, vertex: Vertex<E, A>, payload: V) -> Result<usize, ()> {
+        let next_free = self.guard_insert()?;
+        // The element at which we insert must be deleted.
+        if self.vertices_init.is_set_at(next_free) {
+            return Err(());
+        }
+        self.vertices_init.mark_at(next_free);
+        unsafe { self.set_unchecked(next_free, vertex, payload) };
+        self.len += 1;
+        Ok(next_free)
+    }
+
+    pub fn remove_at(&mut self, index: usize) -> Result<(), ()> {
+        self.guard_remove_at(index)?;
+        if !self.vertices_init.is_set_at(index) {
+            return Err(());
+        }
+        self.vertices_init.clear_at(index);
+        let vertex = self.get_mut(index).ok_or(())?;
+        Ok(())
+    }
+
+    fn guard_insert(&mut self) -> Result<usize, ()> {
+        if self.len == self.cap() {
+            return Err(());
+        }
+        // Last occupied is !0 when empty. We need to intentionally overflow in that case to reach zero.
+        let after_last_occupied = unsafe { self.last_occupied_hint.unchecked_add(1) };
+        if after_last_occupied == self.len {
+            // There are no holes.
+            self.last_occupied_hint = after_last_occupied;
+            self.first_free_hint = after_last_occupied + 1;
+            return Ok(after_last_occupied);
+        }
+        let mut first_free = self.first_free_hint;
+        while first_free < after_last_occupied {
+            if !self.vertices_init.is_set_at(first_free) {
+                self.first_free_hint = first_free + 1;
+                return Ok(first_free);
+            }
+            first_free += 1;
+        }
+
+        // after_last_occupied must be within the capacity, because we still have free spots.
+        debug_assert!(after_last_occupied < self.cap());
+        self.last_occupied_hint = after_last_occupied + 1;
+        self.first_free_hint = after_last_occupied;
+        Ok(after_last_occupied)
+    }
+
+    fn guard_remove_at(&mut self, index: usize) -> Result<(), ()> {
+        if self.len == self.cap() {
+            return Err(());
+        }
+        let last_occupied_hint = self.last_occupied_hint;
+        if last_occupied_hint > index {
+            let mut last_occupied = index + 1;
+            while last_occupied < last_occupied_hint {
+                if self.vertices_init.is_set_at(last_occupied) {
+                    self.last_occupied_hint = last_occupied;
+                    return Ok(());
+                }
+                last_occupied += 1
+            }
+            // No occupied items beyond index.
+            self.last_occupied_hint = index - 1;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn get_payload_unchecked(&self, index: usize) -> &V {
+        unsafe { &*self.vertices_payloads.ptr().add(index) }
+    }
+
+    #[inline]
+    fn get_payload_unchecked_mut(&mut self, index: usize) -> &mut V {
+        unsafe { &mut *self.vertices_payloads.ptr().add(index) }
+    }
+
+    #[inline(never)]
+    unsafe fn set_unchecked(&mut self, index: usize, vertex: Vertex<E, A>, payload: V) {
+        *self.get_unchecked_mut(index) = vertex;
+        if mem::size_of::<V>() != 0 {
+            *self.get_payload_unchecked_mut(index) = payload;
+        }
+    }
+}
+
+unsafe impl<V, E, A: Allocator + Copy> UnsafeIndex<usize> for Pack<V, E, A> {
+    type Output = Vertex<E, A>;
+
+    fn guard_index(&self, index: usize) -> Result<(), ()> {
+        if index < self.vertices.capacity() {
+            Ok(())
         } else {
-            None
+            Err(())
         }
     }
 
-    pub fn check_edge(&self, edge: Edge) -> bool {
-        todo!()
+    unsafe fn get_unchecked(&self, index: usize) -> *const Self::Output {
+        self.vertices.ptr().add(index)
     }
 
-    pub unsafe fn get_mut_unchecked(&mut self, edge_to_vertex: Edge) -> &mut Vertex<E> {
-        todo!()
+    unsafe fn get_unchecked_mut(&mut self, index: usize) -> *mut Self::Output {
+        self.vertices.ptr().add(index)
     }
+}
 
-    pub unsafe fn get_unchecked(&self, edge_to_vertex: Edge) -> &Vertex<E> {
+struct SparsePackedRows<V, E, A: Allocator + Copy> {
+    packs: RawVec<Pack<V, E, A>>,
+}
+
+impl<V, E, A: Allocator + Copy> SparsePackedRows<V, E, A> {
+    pub fn with_capacity_in(capacity: usize, alloc: A) {
         todo!()
     }
 }
 
-fn alloc_array<T, A: Allocator>(capacity: usize, alloc: &A) -> (Unique<T>, usize) {
-    debug_assert!(capacity != 0);
-    debug_assert!(mem::size_of::<T>() != 0);
+fn index_out_of_range() -> ! {
+    panic!("The index is outside the range of valid values.")
+}
 
-    let layout = match Layout::array::<T>(capacity) {
-        Ok(layout) => layout,
-        Err(_) => capacity_overflow(),
+struct BitMarker {
+    raw: RawVec<usize>,
+    len: usize,
+    fmm: u64,
+}
+
+impl BitMarker {
+    const OFFSET_TO_ITEM_RSH: usize = if mem::size_of::<usize>() == 2 {
+        1
+    } else if mem::size_of::<usize>() == 4 {
+        2
+    } else {
+        4
     };
-    if !alloc_guard(layout.size()) {
-        capacity_overflow();
+
+    pub fn new(bits: usize) -> BitMarker {
+        assert!(bits < u32::MAX as usize);
+        let items = align_bits::<usize>(bits);
+        BitMarker {
+            raw: RawVec::with_capacity_zeroed(items),
+            len: items,
+            fmm: get_fast_mod_mul(num_bits::<usize>() as u32),
+        }
     }
-    let ptr = match alloc.allocate(layout) {
-        Ok(ptr) => ptr,
-        Err(_) => handle_alloc_error(layout),
-    };
 
-    (
-        unsafe { Unique::new_unchecked(ptr.cast().as_ptr()) },
-        capacity,
-    )
-}
+    pub fn reserve(&mut self, additional_bits: usize) {
+        self.raw
+            .reserve(self.len, align_bits::<usize>(additional_bits));
+    }
 
-fn array_memory<T>(ptr: Unique<T>, capacity: usize) -> (NonNull<u8>, Layout) {
-    unsafe {
-        (
-            ptr.cast().into(),
-            Layout::from_size_align_unchecked(mem::size_of::<T>() * capacity, mem::align_of::<T>()),
-        )
+    pub fn mark_at(&mut self, bit_offset: usize) {
+        debug_assert!(bit_offset < i32::MAX as usize);
+        let items = bit_offset >> Self::OFFSET_TO_ITEM_RSH;
+        let bytes = unsafe { &mut *self.raw.ptr().add(items) };
+        let mask = 1 << fast_mod(bit_offset as u32, num_bits::<usize>() as u32, self.fmm);
+        *bytes |= mask;
+    }
+
+    pub fn clear_at(&mut self, bit_offset: usize) {
+        debug_assert!(bit_offset < i32::MAX as usize);
+        let items = bit_offset >> Self::OFFSET_TO_ITEM_RSH;
+        let bytes = unsafe { &mut *self.raw.ptr().add(items) };
+        let mask = 1 << fast_mod(bit_offset as u32, num_bits::<usize>() as u32, self.fmm);
+        *bytes &= !mask;
+    }
+
+    pub fn is_set_at(&self, bit_offset: usize) -> bool {
+        debug_assert!(bit_offset < i32::MAX as usize);
+        let items = bit_offset >> Self::OFFSET_TO_ITEM_RSH;
+        let bytes = unsafe { &*self.raw.ptr().add(items) };
+        let mask = 1 << fast_mod(bit_offset as u32, num_bits::<usize>() as u32, self.fmm);
+        (*bytes & mask) != 0
     }
 }
 
-// We need to guarantee the following:
-// * We don't ever allocate `> isize::MAX` byte-size objects.
-// * We don't overflow `usize::MAX` and actually allocate too little.
-//
-// On 64-bit we just need to check for overflow since trying to allocate
-// `> isize::MAX` bytes will surely fail. On 32-bit and 16-bit we need to add
-// an extra guard for this in case we're running on a platform which can use
-// all 4GB in user-space, e.g., PAE or x32.
-
-#[inline]
-fn alloc_guard(alloc_size: usize) -> bool {
-    !(usize::BITS < 64 && alloc_size > isize::MAX as usize)
+/// https://arxiv.org/abs/1902.01961
+fn get_fast_mod_mul(div: u32) -> u64 {
+    u64::MAX / div as u64 + 1
 }
 
-// One central function responsible for reporting capacity overflows. This'll
-// ensure that the code generation related to these panics is minimal as there's
-// only one location which panics rather than a bunch throughout the module.
-#[cfg(not(no_global_oom_handling))]
-fn capacity_overflow() -> ! {
-    panic!("capacity overflow");
+fn fast_mod(val: u32, div: u32, mul: u64) -> u32 {
+    debug_assert!(div <= i32::MAX as u32);
+    let hi = (((((mul * (val as u64)) >> 32) + 1) * (div as u64)) >> 32) as u32;
+    debug_assert!(hi == val % div);
+    hi
+}
+
+const fn num_bits<T>() -> usize {
+    mem::size_of::<T>() * 8
+}
+
+fn align_bits<T>(bits: usize) -> usize {
+    (bits - 1) / num_bits::<T>() + 1
+}
+
+fn log_2(x: i32) -> u32 {
+    assert!(x > 0);
+    num_bits::<i32>() as u32 - x.leading_zeros() - 1
 }
